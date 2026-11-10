@@ -4,7 +4,7 @@
 #   security    Trivy: the repository (NuGet dependencies, secrets), later the image
 #   package     docker build on the ASP.NET Core image from MCR, push to the GitLab Container Registry
 #   staging     migrate the database (pipeline step), pull the image with the deploy token, restart the unit   (automatic)
-#   production  the same                                                                                          (manual)
+#   production  the same, but one job: it waits for the approval first, then migrates and deploys   (manual)
 
 include:
   - project: examples/ci-templates
@@ -145,6 +145,7 @@ trivy:image:
     paths: [trivy-image.json]
 
 # Database migrations are a pipeline step here (the Java projects run them at application startup instead).
+# Staging migrates in its own job; production migrates inside deploy:production, after the approval (see below).
 .migrate:
   # runtime-deps: only what the self-contained migration bundle needs, plus an SSH client for the tunnel
   image: mcr.microsoft.com/dotnet/runtime-deps:10.0
@@ -166,19 +167,6 @@ migrate:staging:
     action: prepare
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-migrate:production:
-  extends: .migrate
-  stage: production
-  needs: [build, deploy:staging]
-  variables:
-    DEPLOY_ENV: production
-  environment:
-    name: production
-    action: prepare
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
 
 .deploy:
   image: rockylinux/rockylinux:10
@@ -202,17 +190,28 @@ deploy:staging:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# Production: the migration runs INSIDE the deployment job, so it happens only after the deployment has been approved
+# (a separate manual migration job could be started by any developer and would change the schema before the approver
+# had been asked). The job image is the one the migration bundle needs; it also has everything release.sh uses.
 deploy:production:
-  extends: .deploy
   stage: production
-  needs: [build-image, migrate:production]
+  image: mcr.microsoft.com/dotnet/runtime-deps:10.0
+  needs: [build, build-image, deploy:staging]
+  resource_group: $APP-production
   variables:
     DEPLOY_ENV: production
   environment:
     name: production
     url: https://$APP-production.$EXAMPLES_DOMAIN
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client curl >/dev/null
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/migrate.sh production
+    - deploy/release.sh production
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
 
 .rollback:
   image: rockylinux/rockylinux:10
