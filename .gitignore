@@ -1,0 +1,12 @@
+bin/
+obj/
+publish/
+efbundle
+TestResults/
+coverage/
+.nuget/
+.tools/
+.trivycache/
+*.user
+.vs/
+.idea/

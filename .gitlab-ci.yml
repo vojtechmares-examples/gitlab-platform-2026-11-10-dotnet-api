@@ -1,0 +1,247 @@
+# .NET 10 REST API (Swagger) with PostgreSQL, deployed as a container to a Linux server with "docker run".
+#   build       restore (locked), compile, publish, and the EF Core migration bundle
+#   test        xUnit tests, code coverage (Cobertura + HTML report as artifacts)
+#   security    Trivy: the repository (NuGet dependencies, secrets), later the image
+#   package     docker build on the ASP.NET Core image from MCR, push to the GitLab Container Registry
+#   staging     migrate the database (pipeline step), pull the image with the deploy token, restart the unit   (automatic)
+#   production  the same                                                                                          (manual)
+
+include:
+  - project: examples/ci-templates
+    ref: main
+    file: /rocky.yml
+
+stages: [build, test, security, package, staging, production]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  APP: dotnet-api
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget"
+
+# The .NET SDK image from Microsoft (mcr.microsoft.com). The GitLab Dependency Proxy only caches Docker Hub,
+# so it cannot serve this one (see dotnet-desktop for the proxy in use).
+.dotnet:
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  cache:
+    key: nuget-$APP
+    paths: [.nuget/]
+
+build:
+  extends: .dotnet
+  stage: build
+  script:
+    - dotnet restore --locked-mode
+    - dotnet build -c Release --no-restore
+    - dotnet publish src/DotnetApi/DotnetApi.csproj -c Release --no-build -o publish
+    # One self-contained executable that carries every migration; the staging and production jobs run it.
+    - dotnet tool restore
+    - dotnet ef migrations bundle --project src/DotnetApi --self-contained -r linux-x64 --output efbundle --force
+  artifacts:
+    paths: [publish/, efbundle]
+    expire_in: 1 week
+
+test:
+  extends: .dotnet
+  stage: test
+  needs: []
+  script:
+    - dotnet restore --locked-mode
+    - >
+      dotnet test -c Release --no-restore --settings coverlet.runsettings
+      --logger "junit;LogFilePath=$CI_PROJECT_DIR/TestResults/junit.xml"
+      --collect:"XPlat Code Coverage" --results-directory TestResults
+    - dotnet tool restore
+    - dotnet reportgenerator -reports:"TestResults/*/coverage.cobertura.xml" -targetdir:coverage -reporttypes:"TextSummary;Html;Cobertura"
+    - cat coverage/Summary.txt
+  # the number GitLab shows next to the job and in merge requests
+  coverage: '/Line coverage: (\d+\.?\d*)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - coverage/           # the HTML report and Cobertura XML: download them from the job
+    reports:
+      junit: TestResults/junit.xml
+      coverage_report:      # line coverage in the merge request diff
+        coverage_format: cobertura
+        path: coverage/Cobertura.xml
+
+# Trivy through the Dependency Proxy. The vulnerability database is cached between jobs.
+.trivy:
+  image:
+    name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:0.76.2
+    entrypoint: [""]
+  variables:
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+    TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+    TRIVY_NO_PROGRESS: "true"
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+
+# The repository: NuGet dependencies (packages.lock.json) and committed secrets
+trivy:repository:
+  extends: .trivy
+  stage: security
+  needs: []
+  script:
+    - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --format json --output trivy-repository.json .
+    - trivy convert --format table trivy-repository.json
+    # the gate: fixable CRITICAL findings fail the job (it is allowed to fail, so the pipeline shows a warning)
+    - trivy convert --severity CRITICAL --ignore-unfixed --exit-code 1 --format table trivy-repository.json > /dev/null
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [trivy-repository.json]
+
+build-image:
+  stage: package
+  needs: [build]
+  image: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:29
+  services:
+    - name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:29-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    # Docker 29 adds provenance attestation manifests that the GitLab 19.5 registry (metadata database) rejects.
+    BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --pull --build-arg BUILD_ID=$CI_PIPELINE_ID -t "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID"
+
+# The image that was just built, scanned in the registry
+trivy:image:
+  extends: .trivy
+  stage: package
+  needs: [build-image]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - trivy image --severity HIGH,CRITICAL --format json --output trivy-image.json "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID"
+    - trivy convert --format table trivy-image.json
+    - trivy convert --severity CRITICAL --ignore-unfixed --exit-code 1 --format table trivy-image.json > /dev/null
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [trivy-image.json]
+
+# Database migrations are a pipeline step here (the Java projects run them at application startup instead).
+.migrate:
+  # runtime-deps: only what the self-contained migration bundle needs, plus an SSH client for the tunnel
+  image: mcr.microsoft.com/dotnet/runtime-deps:10.0
+  needs: [build, trivy:image]
+  resource_group: $APP-$DEPLOY_ENV
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client >/dev/null
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/migrate.sh $DEPLOY_ENV
+
+migrate:staging:
+  extends: .migrate
+  stage: staging
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    action: prepare
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+migrate:production:
+  extends: .migrate
+  stage: production
+  needs: [build, deploy:staging]
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    action: prepare
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+.deploy:
+  image: rockylinux/rockylinux:10
+  resource_group: $APP-$DEPLOY_ENV
+  before_script:
+    - !reference [.rocky-dnf, before_script]
+    - dnf -y -q install openssh-clients curl
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/release.sh $DEPLOY_ENV
+
+deploy:staging:
+  extends: .deploy
+  stage: staging
+  needs: [build-image, migrate:staging]
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    url: https://$APP-staging.$EXAMPLES_DOMAIN
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy:production:
+  extends: .deploy
+  stage: production
+  needs: [build-image, migrate:production]
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    url: https://$APP-production.$EXAMPLES_DOMAIN
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.rollback:
+  image: rockylinux/rockylinux:10
+  needs: []
+  before_script:
+    - !reference [.rocky-dnf, before_script]
+    - dnf -y -q install openssh-clients curl
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/rollback.sh $DEPLOY_ENV
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+
+rollback:staging:
+  extends: .rollback
+  stage: staging
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    action: access
+
+rollback:production:
+  extends: .rollback
+  stage: production
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    action: access
