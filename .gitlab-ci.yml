@@ -94,8 +94,8 @@ trivy:repository:
   script:
     - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --format json --output trivy-repository.json .
     - trivy convert --format table trivy-repository.json
-    # the gate: fixable CRITICAL findings fail the job (it is allowed to fail, so the pipeline shows a warning)
-    - trivy convert --severity CRITICAL --ignore-unfixed --exit-code 1 --format table trivy-repository.json > /dev/null
+    # the gate: CRITICAL findings fail the job (it is allowed to fail, so the pipeline shows a warning)
+    - trivy convert --severity CRITICAL --exit-code 1 --format table trivy-repository.json > /dev/null
   allow_failure: true
   artifacts:
     when: always
@@ -137,7 +137,7 @@ trivy:image:
   script:
     - trivy image --severity HIGH,CRITICAL --format json --output trivy-image.json "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID"
     - trivy convert --format table trivy-image.json
-    - trivy convert --severity CRITICAL --ignore-unfixed --exit-code 1 --format table trivy-image.json > /dev/null
+    - trivy convert --severity CRITICAL --exit-code 1 --format table trivy-image.json > /dev/null
   allow_failure: true
   artifacts:
     when: always
