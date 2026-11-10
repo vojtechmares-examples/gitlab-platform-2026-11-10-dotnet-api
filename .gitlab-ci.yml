@@ -216,21 +216,6 @@ deploy:production:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
 
-# TEMPORARY: the same job definition against staging, to prove it without needing the production approval
-check:single-job:
-  extends: .migrate-and-deploy
-  stage: staging
-  needs: [build, build-image, deploy:staging]
-  variables:
-    DEPLOY_ENV: staging
-  environment:
-    name: staging
-    action: prepare
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
-      allow_failure: true
-
 .rollback:
   image: rockylinux/rockylinux:10
   needs: []
