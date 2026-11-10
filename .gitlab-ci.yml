@@ -190,28 +190,46 @@ deploy:staging:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-# Production: the migration runs INSIDE the deployment job, so it happens only after the deployment has been approved
-# (a separate manual migration job could be started by any developer and would change the schema before the approver
-# had been asked). The job image is the one the migration bundle needs; it also has everything release.sh uses.
-deploy:production:
-  stage: production
+# Migration and deployment in ONE job, so that the migration cannot happen before the deployment has been approved.
+# The job image is the one the migration bundle needs; it also has everything release.sh uses.
+.migrate-and-deploy:
   image: mcr.microsoft.com/dotnet/runtime-deps:10.0
+  resource_group: $APP-$DEPLOY_ENV
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client curl >/dev/null
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/migrate.sh $DEPLOY_ENV
+    - deploy/release.sh $DEPLOY_ENV
+
+# Production: migrates inside the approval-gated deployment job (see above)
+deploy:production:
+  extends: .migrate-and-deploy
+  stage: production
   needs: [build, build-image, deploy:staging]
-  resource_group: $APP-production
   variables:
     DEPLOY_ENV: production
   environment:
     name: production
     url: https://$APP-production.$EXAMPLES_DOMAIN
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client curl >/dev/null
-    - !reference [.ssh-setup, before_script]
-  script:
-    - deploy/migrate.sh production
-    - deploy/release.sh production
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
+
+# TEMPORARY: the same job definition against staging, to prove it without needing the production approval
+check:single-job:
+  extends: .migrate-and-deploy
+  stage: staging
+  needs: [build, build-image, deploy:staging]
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    action: prepare
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
 
 .rollback:
   image: rockylinux/rockylinux:10
