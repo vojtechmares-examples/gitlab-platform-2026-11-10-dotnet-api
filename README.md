@@ -18,3 +18,22 @@ ASP.NET Core (.NET 10) REST API with **Swagger**, EF Core and PostgreSQL, deploy
 
 Run it on a laptop: `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16`, then
 `dotnet ef database update --project src/DotnetApi` and `dotnet run --project src/DotnetApi`.
+
+## CI configuration
+
+The pipeline reads the CI/CD variables below (*Settings > CI/CD > Variables*). Variables that start with `CI_` are predefined by GitLab.
+
+| Variable | Set on | Type | Used for |
+|----------|--------|------|----------|
+| `DEPLOY_HOST` | group `examples` | Variable | Address of the deploy server |
+| `DEPLOY_SSH_PORT` | group `examples` | Variable | SSH port of the deploy server (`6022`) |
+| `DEPLOY_USER` | group `examples` | Variable | Account the pipelines log in as (`deploy`) |
+| `SSH_KNOWN_HOSTS` | group `examples` | Variable | Host keys of the deploy server; the connection uses `StrictHostKeyChecking yes` |
+| `SSH_PRIVATE_KEY` | group `examples` | File, **protected** | Private key of the `deploy` account |
+| `EXAMPLES_DOMAIN` | group `examples` | Variable | Parent domain of the applications (`examples.maresdemo.com`); the deploy job waits for `https://dotnet-api-<env>.$EXAMPLES_DOMAIN` |
+| `DB_PASSWORD` | this project, **once per environment scope** (`staging`, `production`) | Variable, **masked**, **protected** | Password of the PostgreSQL role `dotnet_api_<env>`. `deploy/migrate.sh` hands it to the migration bundle through the SSH tunnel and stops when it is missing. Use the value of `DB_PASSWORD_DOTNET_API` of the same environment in the `ansible` project, which creates the role |
+| `CI_DEPLOY_USER`, `CI_DEPLOY_PASSWORD` | deploy token of this project | Predefined, from the token named **`gitlab-deploy-token`** (scope `read_registry`) | `deploy/release.sh` logs in to the Container Registry on the server with it. Create the token in *Settings > Repository > Deploy tokens*; the name must be exactly `gitlab-deploy-token` |
+
+The group variables are inherited by every project in the `examples` group, so nothing has to be set for them here. The `.ssh-setup` snippet of `examples/ci-templates` turns the first five into `ssh deploy`.
+A **protected** variable is passed only to pipelines on protected branches and tags (`main`), which is where the migration and deploy jobs run.
+The two copies of `DB_PASSWORD` have the environment scopes `staging` and `production`, so a job of the environment `staging` gets the staging password.
